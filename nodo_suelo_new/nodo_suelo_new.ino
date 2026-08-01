@@ -3,14 +3,26 @@
 #include <ArduinoJson.h>       
 #include <Update.h>            
 #include <WiFiClientSecure.h>  
-#include <Preferences.h>        // 🛠️ NVS para almacenamiento persistente
-#include <WebServer.h>          // 🛠️ Servidor Web para el Portal Cautivo
-#include <DNSServer.h>          // 🛠️ Servidor DNS para el Portal Cautivo
+#include <Preferences.h>        
+#include <WebServer.h>          
+#include <DNSServer.h>          
+#include <ArduinoOTA.h>
+#include <esp_task_wdt.h>
+
+
+// ======================================================
+// TELEMETRIA RTC
+// ======================================================
+#include <esp_system.h>
+RTC_DATA_ATTR uint32_t rtc_boot_count = 0;
+RTC_DATA_ATTR uint32_t rtc_wdt_resets = 0;
+RTC_DATA_ATTR uint32_t rtc_wifi_disconnects = 0;
+RTC_DATA_ATTR uint32_t rtc_http_errors = 0;
 
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE
 // ======================================================
-const char* FIRMWARE_VERSION_CODE = "1.0.0";
+const char* FIRMWARE_VERSION_CODE = "1.0.4";
 String latestFirmwareVersion = FIRMWARE_VERSION_CODE;
 
 // ======================================================
@@ -65,11 +77,11 @@ const long CONFIG_FETCH_INTERVAL = 60000; // 1 minuto
 String boxSerialId; 
 
 // 💧 CONFIGURACIÓN PARA MÚLTIPLES SENSORES DE SUELO
-// Pines ADC en la ESP32-C3
-const int sensorPins[] = {4, 5, 6, 7, 8}; 
+// Pines ADC en la ESP32-C3 (A0 suele mapear al GPIO 4 en las SuperMini)
+const int sensorPins[] = {4}; 
 const int numSensores = sizeof(sensorPins) / sizeof(sensorPins[0]); 
 // Etiquetas que el backend espera
-const char* arduinoPins[] = {"A0", "A1", "A2", "A3", "A4"}; 
+const char* arduinoPins[] = {"A0"}; 
 
 // ****************** VALORES DE CALIBRACIÓN COMÚN ******************
 const int valorSeco = 4095;  
@@ -90,11 +102,11 @@ int mediasCrudas[numSensores] = {0};
 // ======================================================
 // 4. DECLARACIONES DE FUNCIONES
 // ======================================================
-// Ciclo de trabajo
 void tomar_y_acumular_muestras();
 bool conectar_wifi();
 void enviar_post();
-void resetear_ciclo();
+void logMessage(String level, String msg);
+
 
 // NVS y Portal Cautivo
 void saveCredentials(const String& ssid, const String& password);
@@ -114,59 +126,83 @@ void perform_update();
 // ======================================================
 // SETUP: Inicialización y Generación del Serial ID
 // ======================================================
+
+void sendTelemetry() {
+  if (WiFi.status() == WL_CONNECTED && backendHost != "") {
+    HTTPClient http;
+    String url = "http://" + backendHost + ":" + String(backendPort) + "/api/health/metrics";
+    http.begin(url);
+    http.setTimeout(3000);
+    http.addHeader("Content-Type", "application/json");
+    String jsonStr = "{\"boxSerialId\":\"" + boxSerialId + "\",";
+    jsonStr += "\"boot_count\":" + String(rtc_boot_count) + ",";
+    jsonStr += "\"wdt_resets\":" + String(rtc_wdt_resets) + ",";
+    jsonStr += "\"wifi_disconnects\":" + String(rtc_wifi_disconnects) + ",";
+    jsonStr += "\"http_errors\":" + String(rtc_http_errors) + "}";
+    http.POST(jsonStr);
+    http.end();
+  }
+}
+
 void setup() {
-  Serial.begin(115200); 
+  Serial.begin(115200);
+
+  esp_reset_reason_t reason = esp_reset_reason();
+  if (reason == ESP_RST_POWERON) {
+    rtc_boot_count = 0;
+    rtc_wdt_resets = 0;
+    rtc_wifi_disconnects = 0;
+    rtc_http_errors = 0;
+  } else if (reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT || reason == ESP_RST_PANIC) {
+    rtc_wdt_resets++;
+  }
+  rtc_boot_count++;
+ 
+  
+  // Iniciar Hardware Watchdog (30 segundos) - API v3.x (ESP-IDF v5)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_err_t err = esp_task_wdt_init(&wdt_config);
+  if (err == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&wdt_config);
+  }
+  esp_task_wdt_add(NULL);
+
   delay(1000); 
   
-  // 1. INICIAR NVS (Preferencias)
   preferences.begin(PREFS_NAMESPACE, false);
-
-  // 2. CONFIGURACIÓN DEL PIN DE RESETEO
   pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
   delay(100); 
 
-  // 3. GENERACIÓN DEL SERIAL ÚNICO (MAC Address)
+  resetWifiStack();
   WiFi.mode(WIFI_STA); 
   boxSerialId = WiFi.macAddress();
   boxSerialId.replace(":", ""); 
-  WiFi.mode(WIFI_OFF);
   
-  Serial.println(F("\n--- 🪴 Nodo de Múltiples Sensores de Suelo (Final) 🪴 ---"));
-  Serial.printf(F("VERSIÓN ACTUAL (Local): %s\n"), latestFirmwareVersion.c_str());
-  Serial.printf(F("ID ÚNICO DEL NODO (MAC): %s\n"), boxSerialId.c_str());
+  logMessage("INFO", "\n--- 🪴 Nodo de Múltiples Sensores de Suelo (Final) 🪴 ---");
+  logMessage("INFO", "🆔 ID: " + boxSerialId);
   
-  // 4. LÓGICA DE RESET MEJORADA: Si BOOT está presionado, forzar AP
   if (digitalRead(WIFI_RESET_PIN) == LOW) {
-    Serial.println(F("🚨 BOTÓN BOOT DETECTADO. BORRANDO CREDENCIALES y lanzando Portal..."));
     clearCredentials(); 
     startConfigPortal(); 
   }
   
-  // 5. INTENTAR CARGAR CREDENCIALES O USAR DEFAULTS
   bool credentialsLoaded = loadCredentials();
   if (!credentialsLoaded) {
-      Serial.println(F("🟡 INFO: No hay credenciales. Forzando credenciales por defecto..."));
       saveCredentials(DEFAULT_SSID, DEFAULT_PASS); 
       loadCredentials();
       credentialsLoaded = true; 
   }
   
-  // 6. INTENTAR CONECTAR
   if (credentialsLoaded && conectar_wifi()) {
-      Serial.println(F("✅ Conexión Wi-Fi exitosa."));
-      
+      ArduinoOTA.begin();
       obtener_remote_config(); 
       check_for_update();
       lastConfigFetch = millis();
-      
-      // 7. DESCONEXIÓN INICIAL
-      WiFi.disconnect(true); 
-      WiFi.mode(WIFI_OFF);
-      
-      Serial.printf(F("Intervalo de Muestreo/Envío (Remoto): %ld ms.\n"), intervaloEnvioMs);
   } else {
-      // 8. FALLO: Iniciar PORTAL CAUTIVO
-      Serial.println(F("❌ Fallo al conectar. Iniciando Portal Cautivo..."));
       startConfigPortal(); 
   }
 }
@@ -175,94 +211,56 @@ void setup() {
 // BUCLE PRINCIPAL (LÓGICA DE ESTADOS Y TIEMPO DINÁMICO)
 // ======================================================
 void loop() {
+  esp_task_wdt_reset();
+  ArduinoOTA.handle();
+
   unsigned long tiempoActual = millis();
 
-  // --- ESTADO 1: MUESTREO ---
-  if (muestrasTomadas < NUM_MUESTRAS) {
-    if (tiempoActual - tiempoUltimaMuestra >= intervaloEnvioMs) { 
-      tiempoUltimaMuestra = tiempoActual;
-      tomar_y_acumular_muestras();
-      Serial.printf(F("Muestra %d de %d tomada.\n"), muestrasTomadas, NUM_MUESTRAS);
-    }
-    return;
+  static unsigned long lastTelemetry = 0;
+  if (tiempoActual - lastTelemetry >= 3600000 || lastTelemetry == 0) { // 1 hora o al iniciar
+    lastTelemetry = tiempoActual == 0 ? 1 : tiempoActual;
+    sendTelemetry();
   }
 
-  // --- ESTADO 2: GESTIÓN REMOTA, CONEXIÓN, ENVÍO y DESCONEXIÓN ---
-  if (muestrasTomadas == NUM_MUESTRAS) {
+  
+  if (tiempoActual - lastConfigFetch >= CONFIG_FETCH_INTERVAL) {
+      if (conectar_wifi()) { 
+          obtener_remote_config();
+          check_for_update();
+          lastConfigFetch = tiempoActual;
+      }
+  }
+  
+  if (tiempoActual - tiempoUltimaMuestra >= intervaloEnvioMs) { 
+    tiempoUltimaMuestra = tiempoActual;
     
-    // 2.1. Gestión de Configuración Remota (Chequea cada CONFIG_FETCH_INTERVAL)
-    if (tiempoActual - lastConfigFetch >= CONFIG_FETCH_INTERVAL) {
-        if (conectar_wifi()) { 
-            obtener_remote_config();
-            check_for_update();
-            lastConfigFetch = tiempoActual;
-            WiFi.disconnect(true); 
-            WiFi.mode(WIFI_OFF);
-        } else {
-            Serial.println(F("⚠️ Fallo la conexión para Remote Config. Saltando chequeo."));
-        }
+    // Muestrear y promediar bloqueante rapido
+    for(int s=0; s<numSensores; s++) {
+      long sum = 0;
+      for (int i=0; i<NUM_MUESTRAS; i++) {
+        sum += analogRead(sensorPins[s]);
+        delay(2);
+      }
+      mediasCrudas[s] = sum / NUM_MUESTRAS;
     }
     
-    // 2.2. Envío de Datos (Condicionado por flagActivo)
-    if (flagActivo) {
-        if (conectar_wifi()) {
-          enviar_post(); 
-        } else {
-            Serial.println(F("❌ Falló la reconexión para ENVÍO. Reiniciando..."));
-            delay(5000);
-            ESP.restart();
-        }
-    } else {
-        Serial.println(F("❌ Envío omitido: Flag de envío inactiva."));
+    if (flagActivo && conectar_wifi()) {
+      enviar_post(); 
     }
-    
-    // 2.3. DESCONEXIÓN y Reset del ciclo
-    Serial.println(F("\n🔌 Desactivando Wi-Fi y reiniciando ciclo..."));
-    WiFi.disconnect(true); 
-    WiFi.mode(WIFI_OFF); 
-    delay(500); 
-    
-    resetear_ciclo();
-    Serial.println(F("🔄 Ciclo completado. Wi-Fi apagado. Reiniciando muestreo."));
   }
 }
+
 
 // ======================================================
 // FUNCIONES DE MUESTREO Y ENVÍO
 // ======================================================
 
-void tomar_y_acumular_muestras() {
-  // Aseguramos que el Wi-Fi está APAGADO antes de leer el ADC.
-  if (WiFi.getMode() != WIFI_MODE_NULL) {
-    WiFi.mode(WIFI_OFF);
-  }
-  delay(100); // Espera para estabilización ADC
-  
-  for (int i = 0; i < numSensores; i++) {
-    int valorAnalogo = analogRead(sensorPins[i]);
-    lecturas[i][muestrasTomadas] = valorAnalogo;
-  }
-  muestrasTomadas++;
-}
+// (tomar_y_acumular_muestras ya no se usa, lo integramos en loop)
 
 void enviar_post() {
-  Serial.println("📦 Filtrando, calculando media y preparando envío POST...");
+  logMessage("INFO", "📦 Filtrando, calculando media y preparando envío POST...");
   
-  // 1. Calcular Medias Crudas y Porcentajes para cada sensor
   for (int i = 0; i < numSensores; i++) {
-    long sumaTotal = 0;
-    int maxLectura = 0;
-    
-    for (int j = 0; j < NUM_MUESTRAS; j++) {
-      sumaTotal += lecturas[i][j];
-      if (lecturas[i][j] > maxLectura) {
-        maxLectura = lecturas[i][j];
-      }
-    }
-
-    // Filtrado: Descartar el valor más alto y calcular la media
-    sumaTotal -= maxLectura;
-    mediasCrudas[i] = sumaTotal / (NUM_MUESTRAS - 1);
     
     // Cálculo de porcentaje
     int porcentaje = map(mediasCrudas[i], valorMojado, valorSeco, 100, 0);
@@ -300,6 +298,7 @@ void enviar_post() {
     Serial.printf(F("URL de envío: %s\n"), url.c_str());
     
     http.begin(url);
+    http.setTimeout(3000);
     http.addHeader("Content-Type", "application/json");
     
     int httpResponseCode = http.POST(jsonBuffer);
@@ -313,9 +312,7 @@ void enviar_post() {
   }
 }
 
-void resetear_ciclo() {
-  muestrasTomadas = 0;
-}
+// resetear_ciclo no se usa
 
 // ======================================================
 // IMPLEMENTACIONES DE GESTIÓN DE RED Y CONFIGURACIÓN REMOTA
@@ -363,12 +360,18 @@ void startConfigPortal() {
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
 
-  while (true) {
+  unsigned long portalStart = millis();
+  while (millis() - portalStart < 180000) { // 3 minutos de timeout
+    esp_task_wdt_reset();
     dnsServer.processNextRequest();
     server.handleClient();
     delay(1);
   }
+  Serial.println(F("⏳ Timeout del Portal Cautivo (3 min). Reiniciando nodo para buscar Wi-Fi..."));
+  delay(1000);
+  ESP.restart();
 }
+
 
 void handleRoot() {
   String html = R"raw(<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -415,8 +418,18 @@ void handleSave() {
   }
 }
 
+
+void resetWifiStack() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+}
 bool conectar_wifi() {
+  if (loadedSsid.length() == 0) return false;
+  if (WiFi.status() == WL_CONNECTED) return true;
+
   Serial.print(F("\n📡 Encendiendo Wi-Fi y conectando a: ")); Serial.print(loadedSsid);
+  resetWifiStack();
   WiFi.mode(WIFI_STA);
   // Reducimos la potencia Tx para mejorar la estabilidad si se usa ADC
   WiFi.setTxPower(WIFI_POWER_8_5dBm); 
@@ -425,6 +438,7 @@ bool conectar_wifi() {
 
   unsigned long inicio = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - inicio < TIEMPO_MAX_CONEXION_WIFI)) {
+    esp_task_wdt_reset();
     delay(500);
     Serial.print(F("."));
   }
@@ -450,6 +464,7 @@ bool obtener_remote_config() {
   
   HTTPClient http;
   http.begin(fullUrl); 
+  http.setTimeout(3000);
   int httpCode = http.GET();
   
   if (httpCode == 200) { 
@@ -571,5 +586,26 @@ void perform_update() {
     http.end();
   } else {
     Serial.println(F("❌ ERROR: No se pudo conectar a la URL de firmware."));
+  }
+}
+
+void logMessage(String level, String msg) {
+  Serial.println("[" + level + "] " + msg);
+  if (WiFi.status() == WL_CONNECTED && backendHost != "") {
+    HTTPClient http;
+    String url = "http://" + backendHost + ":" + String(backendPort) + "/sensor-data/logs";
+    http.begin(url);
+    http.setTimeout(3000);
+    http.addHeader("Content-Type", "application/json");
+    
+    DynamicJsonDocument doc(512);
+    doc["boxSerialId"] = boxSerialId;
+    doc["level"] = level;
+    doc["message"] = msg;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    http.POST(jsonStr);
+    http.end();
   }
 }
