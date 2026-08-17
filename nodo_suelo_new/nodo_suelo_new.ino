@@ -3,7 +3,7 @@
 #include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include <Update.h>
+#include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -21,7 +21,7 @@ RTC_DATA_ATTR uint32_t rtc_http_errors = 0;
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE
 // ======================================================
-const char *FIRMWARE_VERSION_CODE = "1.0.4";
+const char *FIRMWARE_VERSION_CODE = "1.0.8-suelo";
 String latestFirmwareVersion = FIRMWARE_VERSION_CODE;
 
 // ======================================================
@@ -52,22 +52,17 @@ String loadedPassword = "";
 const int WIFI_RESET_PIN = 9; // GPIO 9 (Botón BOOT)
 
 // ======================================================
-// 2. CONFIGURACIÓN DINÁMICA (LEÍDA DE FIREBASE)
+// 2. CONFIGURACIÓN DINÁMICA (Nodriza)
 // ======================================================
-// Valores por defecto (Fallback)
-String backendHost = "192.168.68.68";
+String backendHost = ""; // Si está vacío, es Lobo Solitario (reporta directo a la Nodriza)
 int backendPort = 3000;
-String endpoint = "/sensor-data/arduino/batch"; // Valor por defecto
-long intervaloEnvioMs = 4000;
+long intervaloEnvioMs = 60000;
+bool isLoneWolf = true;
 bool flagActivo = true;
-String remoteFirmwareVersion = "0.0.0";
-String firmwareUrl = "";
 
-const String RTDB_CONFIG_URL_BASE = "https://" + String(RTDB_HOST) + "/.json";
-const char *NODE_TYPE_KEY = "NODO_SUELO";
-
-const int TIEMPO_MAX_CONEXION_WIFI = 15000;
-const long CONFIG_FETCH_INTERVAL = 60000; // 1 minuto
+const String NODRIZA_HOST = "nodrizabackend-production.up.railway.app";
+const int TIEMPO_MAX_CONEXION_WIFI = 20000;
+const long CONFIG_FETCH_INTERVAL = 60000;
 
 // ======================================================
 // 3. DATOS DEL DISPOSITIVO Y SENSORES (MÚLTIPLES SENSORES)
@@ -75,16 +70,20 @@ const long CONFIG_FETCH_INTERVAL = 60000; // 1 minuto
 // 🆕 ESTA VARIABLE ALMACENARÁ EL SERIAL ÚNICO GENERADO POR LA MAC
 String boxSerialId;
 
-// 💧 CONFIGURACIÓN PARA MÚLTIPLES SENSORES DE SUELO
-// Pines ADC en la ESP32-C3 (A0 suele mapear al GPIO 4 en las SuperMini)
-const int sensorPins[] = {4};
+// 💧 CONFIGURACIÓN PARA MÚLTIPLES SENSORES DE SUELO (4 SENSORES - ADC1)
+// Sensor 1: GPIO 0 (A0 / ADC1_CH0)
+// Sensor 2: GPIO 1 (A1 / ADC1_CH1)
+// Sensor 3: GPIO 3 (A3 / ADC1_CH3)
+// Sensor 4: GPIO 4 (A4 / ADC1_CH4)
+const int sensorPins[] = {0, 1, 3, 4};
 const int numSensores = sizeof(sensorPins) / sizeof(sensorPins[0]);
-// Etiquetas que el backend espera
-const char *arduinoPins[] = {"A0"};
+// Etiquetas asociadas a cada pin
+const char *arduinoPins[] = {"A0 (GPIO0)", "A1 (GPIO1)", "A3 (GPIO3)", "A4 (GPIO4)"};
 
 // ****************** VALORES DE CALIBRACIÓN COMÚN ******************
-const int valorSeco = 4095;
-const int valorMojado = 250;
+// Sensores Capacitivos v1.2: En aire leen ~3350 (0% H), en agua leen ~1500 (100% H)
+const int valorSeco = 3350;
+const int valorMojado = 1500;
 // ************************************************************
 
 const int NUM_MUESTRAS = 15;
@@ -114,7 +113,7 @@ void handleRoot();
 void handleSave();
 
 // Remote Config y OTA
-bool obtener_remote_config();
+void obtener_remote_config();
 int compareVersions(String current, String remote);
 bool check_for_update();
 void perform_update();
@@ -168,7 +167,15 @@ void setup() {
   delay(1000);
 
   preferences.begin(PREFS_NAMESPACE, false);
+  backendHost = preferences.getString("bHost", "192.168.68.82");
+  backendPort = preferences.getInt("bPort", 5001);
   pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
+  
+  // Configurar resolución y atenuación ADC1 (rango 0V - 3.3V)
+  analogSetAttenuation(ADC_11db);
+  for (int i = 0; i < numSensores; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
   delay(100);
 
   resetWifiStack();
@@ -278,7 +285,10 @@ void loop() {
       Serial.println(F("]"));
 
       mediasCrudas[s] = sum / validSamples;
-      Serial.printf(F("Promedio final filtrado: %d\n"), mediasCrudas[s]);
+      int porcentaje = map(mediasCrudas[s], valorMojado, valorSeco, 100, 0);
+      if (porcentaje < 0) porcentaje = 0;
+      if (porcentaje > 100) porcentaje = 100;
+      Serial.printf(F("Promedio final filtrado: %d | Humedad estimada: %d%%\n"), mediasCrudas[s], porcentaje);
     }
 
     if (flagActivo && conectar_wifi()) {
@@ -294,62 +304,110 @@ void loop() {
 // (tomar_y_acumular_muestras ya no se usa, lo integramos en loop)
 
 void enviar_post() {
-  logMessage("INFO",
-             "📦 Filtrando, calculando media y preparando envío POST...");
+  logMessage("INFO", "📦 Preparando envío POST...");
 
-  for (int i = 0; i < numSensores; i++) {
+  HTTPClient http;
+  String url;
 
-    // Cálculo de porcentaje
-    int porcentaje = map(mediasCrudas[i], valorMojado, valorSeco, 100, 0);
-    if (porcentaje < 0)
-      porcentaje = 0;
-    if (porcentaje > 100)
-      porcentaje = 100;
+  if (!isLoneWolf && backendHost != "") {
+    // Modo Enjambre: Enviar a la GreenBox local
+    url = "http://" + backendHost + ":" + String(backendPort) + "/sensor-data/soil";
+    
+    DynamicJsonDocument doc(512);
+    doc["boxSerialId"] = boxSerialId;
 
-    Serial.printf(F("Sensor %d (%s): %d (Humedad: %d%%)\n"), i + 1,
-                  arduinoPins[i], mediasCrudas[i], porcentaje);
-  }
+    int sumaPorcentajes = 0;
+    JsonArray sensoresArr = doc.createNestedArray("sensors");
+    JsonArray dataArr = doc.createNestedArray("data");
 
-  // 2. Crear el JSON en formato batch
-  DynamicJsonDocument doc(1024);
-  // 🆕 Usa el ID ÚNICO generado por MAC
-  doc["boxSerialId"] = boxSerialId;
-  JsonArray dataArray = doc.createNestedArray("data");
+    for (int i = 0; i < numSensores; i++) {
+      int porcentaje = map(mediasCrudas[i], valorMojado, valorSeco, 100, 0);
+      if (porcentaje < 0) porcentaje = 0;
+      if (porcentaje > 100) porcentaje = 100;
+      sumaPorcentajes += porcentaje;
 
-  // Llenar el arreglo 'data' con los valores de los 5 sensores
-  for (int i = 0; i < numSensores; i++) {
-    JsonObject item = dataArray.createNestedObject();
+      JsonObject sObj = sensoresArr.createNestedObject();
+      sObj["pin"] = arduinoPins[i];
+      sObj["raw"] = mediasCrudas[i];
+      sObj["humidity"] = porcentaje;
 
-    item["arduinoPin"] = arduinoPins[i];
-    item["raw"] = mediasCrudas[i];
-    item["unit"] = "%";
-    item["key"] = String("humedad_suelo_") + arduinoPins[i];
-  }
+      JsonObject dObj = dataArr.createNestedObject();
+      dObj["arduinoPin"] = arduinoPins[i];
+      dObj["raw"] = mediasCrudas[i];
+      dObj["unit"] = "%";
+      dObj["humidity"] = porcentaje;
+    }
 
-  // 3. Serializar y Enviar
-  String jsonBuffer;
-  serializeJson(doc, jsonBuffer);
+    int p0 = map(mediasCrudas[0], valorMojado, valorSeco, 100, 0);
+    p0 = constrain(p0, 0, 100);
+    doc["humidity"] = p0;
+    doc["soilMoisture"] = p0;
 
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    // URL usa backendHost, Port y endpoint DINÁMICOS
-    String url = "http://" + backendHost + ":" + String(backendPort) + endpoint;
+    if (numSensores > 1) {
+      int p1 = map(mediasCrudas[1], valorMojado, valorSeco, 100, 0);
+      doc["soilMoistureA1"] = constrain(p1, 0, 100);
+    }
+    if (numSensores > 2) {
+      int p2 = map(mediasCrudas[2], valorMojado, valorSeco, 100, 0);
+      doc["soilMoistureA2"] = constrain(p2, 0, 100);
+    }
+    if (numSensores > 3) {
+      int p3 = map(mediasCrudas[3], valorMojado, valorSeco, 100, 0);
+      doc["soilMoistureA3"] = constrain(p3, 0, 100);
+    }
 
-    Serial.printf(F("URL de envío: %s\n"), url.c_str());
+    String jsonBuffer;
+    serializeJson(doc, jsonBuffer);
 
     http.begin(url);
     http.setTimeout(3000);
     http.addHeader("Content-Type", "application/json");
 
     int httpResponseCode = http.POST(jsonBuffer);
+    Serial.printf(F("📡 [GreenBox Local] POST -> Code: %d\n"), httpResponseCode);
+    http.end();
+  } else {
+    // Modo Lobo Solitario: Enviar directo a la Nodriza Cloud
+    url = "https://" + NODRIZA_HOST + "/api/sync";
 
-    if (httpResponseCode > 0) {
-      Serial.printf(F("✅ POST exitoso. Código: %d\n"), httpResponseCode);
-    } else {
-      Serial.printf(F("❌ Error en el POST. Código: %d. Mensaje: %s\n"),
-                    httpResponseCode,
-                    http.errorToString(httpResponseCode).c_str());
+    DynamicJsonDocument doc(1024);
+    doc["carrierId"] = boxSerialId;
+    doc["type"] = "ESP32";
+    
+    JsonArray readings = doc.createNestedArray("readings");
+
+    JsonObject reading = readings.createNestedObject();
+    reading["nodeId"] = boxSerialId;
+
+    int p0 = map(mediasCrudas[0], valorMojado, valorSeco, 100, 0);
+    p0 = constrain(p0, 0, 100);
+    reading["soilMoisture"] = p0;
+
+    if (numSensores > 1) {
+      int p1 = map(mediasCrudas[1], valorMojado, valorSeco, 100, 0);
+      reading["soilMoistureA1"] = constrain(p1, 0, 100);
     }
+    if (numSensores > 2) {
+      int p2 = map(mediasCrudas[2], valorMojado, valorSeco, 100, 0);
+      reading["soilMoistureA2"] = constrain(p2, 0, 100);
+    }
+    if (numSensores > 3) {
+      int p3 = map(mediasCrudas[3], valorMojado, valorSeco, 100, 0);
+      reading["soilMoistureA3"] = constrain(p3, 0, 100);
+    }
+
+    String jsonBuffer;
+    serializeJson(doc, jsonBuffer);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    http.begin(client, url);
+    http.setTimeout(5000);
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.POST(jsonBuffer);
+    Serial.printf(F("🌐 [Nodriza Cloud Directo] POST -> Code: %d\n"), httpResponseCode);
     http.end();
   }
 }
@@ -386,84 +444,200 @@ void clearCredentials() {
 }
 
 void startConfigPortal() {
+  resetWifiStack();
   WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false); // CRÍTICO: Evita que el ESP32-C3 apague la radio
   IPAddress localIP(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-
-  WiFi.softAPConfig(localIP, gateway, subnet);
-  WiFi.softAP(AP_SSID);
-
-  Serial.printf(F("AP creado. Conéctate a '%s' para configurar.\n"), AP_SSID);
-
-  DNSServer dnsServer;
+  WiFi.softAPConfig(localIP, localIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_SSID, NULL, 6, 0, 4);
+  Serial.printf(F("📡 Portal activo. Red: '%s' → http://192.168.4.1\n"),
+                AP_SSID);
   dnsServer.start(53, "*", localIP);
-
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.begin();
+  server.onNotFound([]() {
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+  });
 
+  server.on("/hotspot-detect.html", []() {
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.begin();
   unsigned long portalStart = millis();
-  while (millis() - portalStart < 180000) { // 3 minutos de timeout
+  while (millis() - portalStart < 600000) { // 10 minutos de timeout
     esp_task_wdt_reset();
     dnsServer.processNextRequest();
     server.handleClient();
     delay(1);
   }
-  Serial.println(F("⏳ Timeout del Portal Cautivo (3 min). Reiniciando nodo "
-                   "para buscar Wi-Fi..."));
+  Serial.println(F("⏳ Timeout del Portal Cautivo (10 min). Reiniciando nodo para buscar Wi-Fi..."));
   delay(1000);
   ESP.restart();
 }
 
 void handleRoot() {
-  String html =
-      R"raw(<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Configuracion NODO SUELO</title><style>
-    body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 20px; background-color: #f4f7f6; }
-    .container { max-width: 400px; margin: auto; padding: 25px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    h1 { color: #2E7D32; margin-bottom: 20px; font-size: 24px; }
-    input[type="text"], input[type="password"] { width: 100%; padding: 12px; margin: 10px 0 20px 0; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 16px; }
-    input[type="submit"] { background-color: #2E7D32; color: white; padding: 14px 20px; border: none; border-radius: 6px; cursor: pointer; width: 100%; font-size: 18px; transition: background-color 0.3s; }
-    input[type="submit"]:hover { background-color: #1B5E20; }
-    .footer { margin-top: 20px; color: #757575; font-size: 14px; }
-    .logo { color: #2E7D32; font-size: 30px; margin-bottom: 10px; }
-  </style></head>
-  <body><div class="container"><div class="logo">🪴</div><h1>Configura tu Nodo Suelo</h1>
-  <p>Conéctate a tu red Wi-Fi para que el nodo pueda enviar datos.</p>
-  <p style="font-size: 12px; color: #B00020; font-weight: bold;">MANTÉN PRESIONADO BOOT AL INICIAR para entrar aquí.</p>
-  <form method="POST" action="/save">
-    <label for="ssid">SSID (Nombre de la Red):</label><input type="text" id="ssid" name="ssid" required placeholder="MiRedWiFi">
-    <label for="password">Contraseña:</label><input type="password" id="password" name="password" placeholder="Dejar vacío si no tiene clave">
-    <input type="submit" value="Guardar y Conectar">
-  </form><div class="footer">Version Firmware: )raw" +
-      String(FIRMWARE_VERSION_CODE) + R"raw(</div></div></body></html>)raw";
+  String html = R"raw(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Nodo Suelo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0; padding: 16px;
+      background: #0a0a0a; color: #e8e8e8;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      width: 100%; max-width: 420px;
+      background: #141414; border: 1px solid #3d2f1f;
+      border-radius: 16px; padding: 24px 20px;
+      box-shadow: 0 8px 32px rgba(200, 140, 83, 0.12);
+    }
+    .logo { font-size: 40px; text-align: center; margin-bottom: 8px; }
+    h1 { color: #e6a800; font-size: 22px; text-align: center; margin: 0 0 8px 0; }
+    .sub { text-align: center; color: #9e9e9e; font-size: 14px; margin-bottom: 20px; line-height: 1.4; }
+    label { display: block; color: #c88c00; font-size: 13px; font-weight: 600; margin: 12px 0 6px 0; }
+    input[type="text"], input[type="password"] {
+      width: 100%; padding: 14px 12px; font-size: 16px;
+      background: #0a0a0a; color: #fff;
+      border: 1px solid #7d5a2e; border-radius: 10px;
+    }
+    input:focus { outline: none; border-color: #e6a800; box-shadow: 0 0 0 2px rgba(230,168,0,0.2); }
+    .btn {
+      width: 100%; margin-top: 20px; padding: 15px;
+      background: linear-gradient(135deg, #c88c00, #7d5a2e);
+      color: #000; font-size: 17px; font-weight: 700;
+      border: none; border-radius: 10px; cursor: pointer;
+    }
+    .hint {
+      margin-top: 16px; padding: 10px; border-radius: 8px;
+      background: #1a1a1a; border-left: 3px solid #e6a800;
+      font-size: 12px; color: #bdbdbd; line-height: 1.5;
+    }
+    .footer { text-align: center; margin-top: 18px; font-size: 12px; color: #616161; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🪴</div>
+    <h1>Nodo Suelo</h1>
+    <p class="sub">Configura la red Wi-Fi para enviar niveles de humedad.</p>
+    <form method="POST" action="/save" enctype="application/x-www-form-urlencoded">
+      <label for="ssid">Nombre de la red (SSID)</label>
+      <input type="text" id="ssid" name="ssid" required placeholder="MiRedWiFi" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <label for="password">Contraseña Wi-Fi</label>
+      <input type="password" id="password" name="password" placeholder="Contraseña de la red" autocomplete="new-password" autocapitalize="none">
+      <input class="btn" type="submit" value="Probar y Guardar">
+    </form>
+    <div class="hint">
+      Usa red <strong>2.4 GHz</strong>. Mantén <strong>BOOT</strong> al encender para volver a este portal.
+    </div>
+    <div class="footer">Firmware v)raw" +
+                String(FIRMWARE_VERSION_CODE) + R"raw(</div>
+  </div>
+</body>
+</html>
+)raw";
   server.send(200, "text/html", html);
 }
 
 void handleSave() {
   String newSsid = server.arg("ssid");
   String newPassword = server.arg("password");
+  if (newPassword.length() == 0)
+    newPassword = server.arg("pass");
+  if (newPassword.length() == 0)
+    newPassword = server.arg("p");
+  newSsid.trim();
+  newPassword.trim();
 
-  if (newSsid.length() > 0) {
-    saveCredentials(newSsid, newPassword);
+  Serial.printf(F("📥 Portal recibió: SSID='%s', pass_len=%d\n"),
+                newSsid.c_str(), newPassword.length());
 
-    String successHtml =
-        R"raw(<!DOCTYPE html><html><head><meta http-equiv="refresh" content="5;url=/" /></head><body>
-      <div style="text-align: center; margin-top: 50px;"><h1>✅ Credenciales Guardadas</h1>
-        <p>Intentando conectar a la red: <strong>)raw" +
-        newSsid + R"raw(</strong></p>
-        <p>El nodo se reiniciará en 5 segundos para aplicar la nueva configuración.</p></div></body></html>)raw";
-    server.send(200, "text/html", successHtml);
-
-    server.stop();
-    // dnsServer.stop(); // Se elimina la llamada a dnsServer.stop() aquí para
-    // evitar posibles crashes.
-    Serial.println(F("🔄 Reiniciando ESP32..."));
-    ESP.restart();
-  } else {
-    server.send(200, "text/html", "<h1>❌ ERROR: SSID vacío.</h1>");
+  if (newSsid.length() == 0) {
+    server.send(400, "text/html",
+                "<html><body "
+                "style='background:#0a0a0a;color:#fff;text-align:center;"
+                "padding:40px;'><h1 style='color:#ff5252;'>SSID vacío</h1><a "
+                "style='color:#e6a800;' href='/'>Volver</a></body></html>");
+    return;
   }
+
+  Serial.println(F("⏳ Probando credenciales antes de guardar..."));
+  int estadoFinal = WL_DISCONNECTED;
+  bool conecto = probarCredencialesWifi(newSsid, newPassword, estadoFinal);
+
+  if (!conecto) {
+    String errorHtml = R"raw(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Error WiFi</title>
+  <style>
+    body { font-family: sans-serif; background:#0a0a0a; color:#e8e8e8; text-align:center; padding:32px 20px; }
+    h1 { color:#ff5252; font-size:22px; }
+    p { color:#bdbdbd; line-height:1.6; }
+    .code { color:#e6a800; font-weight:bold; }
+    a { display:inline-block; margin-top:20px; padding:14px 24px; background:#c88c00; color:#000; text-decoration:none; border-radius:10px; font-weight:700; }
+  </style>
+</head>
+<body>
+  <h1>❌ No se pudo conectar</h1>
+  <p>SSID: <strong>)raw" +
+                       newSsid + R"raw(</strong></p>
+  <p>Estado WiFi: <span class="code">)raw" +
+                       String(estadoFinal) + R"raw(</span></p>
+  <p>Revisa SSID, contraseña y que sea red <strong>2.4 GHz</strong>.</p>
+  <a href='/'>Intentar de nuevo</a>
+</body>
+</html>
+)raw";
+    server.send(200, "text/html", errorHtml);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID);
+    return;
+  }
+
+  saveCredentials(newSsid, newPassword);
+  preferences.end();
+
+  String successHtml = R"raw(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Guardado</title>
+  <style>
+    body { font-family: sans-serif; background:#0a0a0a; color:#e8e8e8; text-align:center; padding:40px 20px; }
+    h1 { color:#e6a800; }
+    p { color:#bdbdbd; line-height:1.6; }
+    .ssid { color:#c88c00; font-weight:bold; }
+  </style>
+</head>
+<body>
+  <h1>✅ Conexión exitosa</h1>
+  <p>Red: <span class="ssid">)raw" +
+                       newSsid + R"raw(</span></p>
+  <p>Credenciales guardadas. Reiniciando...</p>
+</body>
+</html>
+)raw";
+  server.send(200, "text/html", successHtml);
+  delay(1500);
+  server.stop();
+  dnsServer.stop();
+  resetWifiStack();
+  ESP.restart();
 }
 
 void resetWifiStack() {
@@ -471,6 +645,37 @@ void resetWifiStack() {
   WiFi.mode(WIFI_OFF);
   delay(1000);
 }
+
+bool probarCredencialesWifi(const String &ssid, const String &password,
+                            int &estadoFinal) {
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long inicio = millis();
+  rtc_wifi_disconnects++;
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - inicio < TIEMPO_MAX_CONEXION_WIFI) {
+    esp_task_wdt_reset();
+    delay(300);
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
+
+  estadoFinal = WiFi.status();
+  if (estadoFinal == WL_CONNECTED) {
+    Serial.printf(F("✅ Prueba WiFi OK. IP: %s\n"),
+                  WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.printf(F("❌ Prueba WiFi falló. Estado: %d\n"), estadoFinal);
+  WiFi.disconnect(true);
+  return false;
+}
+
 bool conectar_wifi() {
   if (loadedSsid.length() == 0)
     return false;
@@ -506,163 +711,71 @@ bool conectar_wifi() {
 
 // *** Funciones de Remote Config y OTA ***
 
-bool obtener_remote_config() {
-  Serial.println(F("\n--- Obteniendo Configuración Dinámica ---"));
-
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
-  String fullUrl = RTDB_CONFIG_URL_BASE + "?auth=" + String(API_KEY);
-
+void obtener_remote_config() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  Serial.println(F("📥 Consultando configuración dinámica en la Nodriza..."));
+  
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
-  http.begin(fullUrl);
-  http.setTimeout(3000);
-  int httpCode = http.GET();
+  http.setTimeout(5000);
+  String url = "https://" + NODRIZA_HOST + "/api/nodes/" + boxSerialId + "/config";
+  http.begin(client, url);
+  
+  int code = http.GET();
+  if (code == 200) {
+    DynamicJsonDocument doc(1024);
+    DeserializationError err = deserializeJson(doc, http.getString());
+    if (!err) {
+      isLoneWolf = doc["remote_config"]["is_lone_wolf"] | false;
+      if (!isLoneWolf && doc["remote_config"]["backend_host"] && !doc["remote_config"]["backend_host"].isNull()) {
+        backendHost = doc["remote_config"]["backend_host"].as<String>();
+        backendPort = doc["remote_config"]["backend_port"] | 5001;
+        
+        Preferences prefs;
+        prefs.begin("nodriza", false);
+        prefs.putString("bHost", backendHost);
+        prefs.putInt("bPort", backendPort);
+        prefs.end();
 
-  if (httpCode == 200) {
-    String payload = http.getString();
-    DynamicJsonDocument doc(1536);
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (error) {
-      Serial.printf(F("❌ Fallo al parsear JSON: %s\n"), error.c_str());
-      http.end();
-      return false;
-    }
-
-    JsonObject remoteConfig = doc[F("remote_config")];
-    if (!remoteConfig.isNull()) {
-      if (remoteConfig.containsKey(F("backend_host")))
-        backendHost = remoteConfig[F("backend_host")].as<String>();
-      if (remoteConfig.containsKey(F("backend_port")))
-        backendPort = remoteConfig[F("backend_port")].as<int>();
-
-      // 🆕 CAMBIO CLAVE: BUSCAR 'endpoint_humedad_suelo'
-      if (remoteConfig.containsKey(F("endpoint_humedad_suelo"))) {
-        endpoint = remoteConfig[F("endpoint_humedad_suelo")].as<String>();
-      } else if (remoteConfig.containsKey(F("endpoint_humedad"))) {
-        // Fallback por si la clave vieja todavía existe
-        endpoint = remoteConfig[F("endpoint_humedad")].as<String>();
+        Serial.println(F("✅ Asignado a GreenBox (Enjambre). Guardado en NVS."));
+        Serial.printf(F("   → IP GreenBox Local: %s:%d\n"), backendHost.c_str(), backendPort);
+      } else {
+        backendHost = "";
+        isLoneWolf = true;
+        Preferences prefs;
+        prefs.begin("nodriza", false);
+        prefs.putString("bHost", "");
+        prefs.end();
+        Serial.println(F("🐺 Modo Lobo Solitario (Reporta directamente a Nodriza Cloud)."));
       }
-
-      if (remoteConfig.containsKey(F("intervalo_envio_ms")))
-        intervaloEnvioMs = remoteConfig[F("intervalo_envio_ms")].as<long>();
-      if (remoteConfig.containsKey(F("flag_activo")))
-        flagActivo = remoteConfig[F("flag_activo")].as<bool>();
     }
-
-    JsonObject nodeConfig = doc[F("firmware_updates")][NODE_TYPE_KEY];
-    if (!nodeConfig.isNull()) {
-      if (nodeConfig.containsKey(F("latest_firmware_version")))
-        remoteFirmwareVersion =
-            nodeConfig[F("latest_firmware_version")].as<String>();
-      if (nodeConfig.containsKey(F("firmware_url")))
-        firmwareUrl = nodeConfig[F("firmware_url")].as<String>();
-    }
-
-    Serial.printf(F("Backend: %s:%d%s | Intervalo: %ld ms | Ver. Remota: %s\n"),
-                  backendHost.c_str(), backendPort, endpoint.c_str(),
-                  intervaloEnvioMs, remoteFirmwareVersion.c_str());
-    http.end();
-    return true;
-  } else {
-    Serial.printf(F("❌ Fallo al obtener la configuración (HTTP Code: %d).\n"),
-                  httpCode);
-    http.end();
-    return false;
   }
-}
-
-int compareVersions(String current, String remote) {
-  int cur_v[3] = {0, 0, 0};
-  int rem_v[3] = {0, 0, 0};
-
-  sscanf(current.c_str(), "%d.%d.%d", &cur_v[0], &cur_v[1], &cur_v[2]);
-  sscanf(remote.c_str(), "%d.%d.%d", &rem_v[0], &rem_v[1], &rem_v[2]);
-
-  for (int i = 0; i < 3; i++) {
-    if (cur_v[i] < rem_v[i])
-      return -1;
-    if (cur_v[i] > rem_v[i])
-      return 1;
-  }
-  return 0;
+  http.end();
 }
 
 bool check_for_update() {
-  if (remoteFirmwareVersion.isEmpty() ||
-      compareVersions(latestFirmwareVersion, remoteFirmwareVersion) >= 0) {
-    Serial.printf(F("✅ OTA: La versión actual (%s) está al día.\n"),
-                  latestFirmwareVersion.c_str());
+  if (WiFi.status() != WL_CONNECTED)
     return false;
-  }
-
-  Serial.printf(F("🔴 📢 ACTUALIZACIÓN REQUERIDA: %s -> %s\n"),
-                latestFirmwareVersion.c_str(), remoteFirmwareVersion.c_str());
-  if (!firmwareUrl.isEmpty()) {
-    perform_update();
-    return true;
-  } else {
-    Serial.println(
-        F("❌ ERROR OTA: URL de firmware vacía. No se puede actualizar."));
-    return false;
-  }
-}
-
-void perform_update() {
-  Serial.printf(F("🚀 Iniciando actualización OTA desde: %s\n"),
-                firmwareUrl.c_str());
-
-  if (!firmwareUrl.startsWith("https://")) {
-    Serial.println(F("❌ ERROR: La URL del firmware debe ser HTTPS."));
-    return;
-  }
+  Serial.println("[OTA] Buscando actualizaciones en la Nodriza...");
 
   WiFiClientSecure client;
-  client.setInsecure(); // Permite conexiones sin verificación de certificado
-                        // (para GitHub raw o testing)
+  client.setInsecure();
+  String otaUrl =
+      "https://nodrizabackend-production.up.railway.app/api/ota/check/" +
+      boxSerialId;
 
-  HTTPClient http;
+  t_httpUpdate_return ret =
+      httpUpdate.update(client, otaUrl, FIRMWARE_VERSION_CODE);
 
-  if (http.begin(client, firmwareUrl)) {
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-      int contentLength = http.getSize();
-      Serial.printf(F("Tamaño del nuevo firmware: %d bytes.\n"), contentLength);
-
-      if (Update.begin(contentLength)) {
-        WiFiClient *stream = http.getStreamPtr();
-        size_t written = Update.writeStream(*stream);
-
-        if (written == contentLength) {
-          Serial.printf(F("Descarga y escritura completada: %d bytes.\n"),
-                        written);
-        } else {
-          Serial.printf(F("❌ Error de escritura. Escrito %zu de %d bytes.\n"),
-                        written, contentLength);
-        }
-
-        if (Update.end()) {
-          Serial.println(
-              F("✅ Actualización finalizada exitosamente. Reiniciando..."));
-          ESP.restart();
-        } else {
-          Serial.printf(F("❌ Error al finalizar. Error: %d. Mensaje: %s\n"),
-                        Update.getError(), Update.errorString());
-        }
-      } else {
-        Serial.println(
-            F("❌ ERROR: No hay suficiente espacio para la actualización."));
-      }
-    } else {
-      Serial.printf(F("❌ ERROR HTTP (%d): No se pudo descargar el archivo.\n"),
-                    httpCode);
-    }
-    http.end();
-  } else {
-    Serial.println(F("❌ ERROR: No se pudo conectar a la URL de firmware."));
+  if (ret == HTTP_UPDATE_NO_UPDATES) {
+    Serial.println("[OTA] No hay actualizaciones (304).");
+  } else if (ret == HTTP_UPDATE_FAILED) {
+    Serial.printf("[OTA] Error (%d): %s", httpUpdate.getLastError(),
+    httpUpdate.getLastErrorString().c_str());
   }
+  return false;
 }
 
 void logMessage(String level, String msg) {
